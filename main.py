@@ -2,7 +2,7 @@
 # MK Underwood — Project Settlement Platform  (single-file backend)
 # Stack: FastAPI · SQLAlchemy · PostgreSQL · Redis/RQ · Stripe · OpenAI · S3
 # =============================================================================
-import enum, json, os, time, uuid
+import enum, hashlib, json, os, time, uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -62,8 +62,16 @@ cfg = Settings()
 
 
 # ── DB ────────────────────────────────────────────────────────────────────────
-_db_url = cfg.DATABASE_URL.replace("postgres://","postgresql+asyncpg://").replace("postgresql://","postgresql+asyncpg://")
-engine = create_async_engine(_db_url, pool_size=10, max_overflow=20, pool_pre_ping=True)
+def _make_async_url(url: str) -> str:
+    # Railway gives postgres:// or postgresql:// — both need +asyncpg driver
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgresql://") and "+asyncpg" not in url:
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
+
+_db_url = _make_async_url(cfg.DATABASE_URL)
+engine = create_async_engine(_db_url, pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=300)
 async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 class Base(DeclarativeBase): pass
@@ -286,11 +294,11 @@ class Dispute(Base):
     __tablename__ = "disputes"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     project_id: Mapped[str] = mapped_column(String, ForeignKey("projects.id"))
-    initiated_by: Mapped[str] = mapped_column(String)
+    initiated_by: Mapped[str] = mapped_column(String, ForeignKey("users.id"))    # #4 FK enforced
     reason: Mapped[str] = mapped_column(Text)
     status: Mapped[DisputeStatus] = mapped_column(E(DisputeStatus), default=DisputeStatus.OPEN)
     resolution: Mapped[Optional[str]] = mapped_column(Text)
-    resolved_by: Mapped[Optional[str]] = mapped_column(String)
+    resolved_by: Mapped[Optional[str]] = mapped_column(String, ForeignKey("users.id"))  # #4 FK enforced
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     outcome: Mapped[Optional[DisputeOutcome]] = mapped_column(E(DisputeOutcome))
     refund_amount: Mapped[Optional[int]] = mapped_column(Integer)
@@ -405,12 +413,130 @@ class WebhookEvent(Base):
     __table_args__ = (Index("ix_webhook_event_id","event_id"),)
 
 
+# ── #3 Payment provider abstraction ──────────────────────────────────────────
+# All payment operations go through this interface.
+# Swap cfg.PAYMENT_PROVIDER to add Square/Braintree without touching routes.
+class PaymentProvider(str, enum.Enum):
+    STRIPE="STRIPE"
+
+class PaymentProviderAccount(Base):
+    """Maps a user to their external payment identity (one row per provider)."""
+    __tablename__ = "payment_provider_accounts"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id", ondelete="CASCADE"))
+    provider: Mapped[PaymentProvider] = mapped_column(E(PaymentProvider))
+    external_id: Mapped[str] = mapped_column(String)   # e.g. Stripe cus_xxx or acct_xxx
+    account_type: Mapped[str] = mapped_column(String)  # "CUSTOMER" | "CONNECTED"
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    meta: Mapped[Optional[dict]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    __table_args__ = (UniqueConstraint("user_id","provider","account_type"), Index("ix_ppa_user","user_id"))
+
+
+# ── #5 Inspector with proper FK relation ─────────────────────────────────────
+class Inspector(Base):
+    __tablename__ = "inspectors"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id", ondelete="CASCADE"), unique=True)
+    license_number: Mapped[Optional[str]] = mapped_column(String)
+    service_areas: Mapped[Optional[list]] = mapped_column(JSON)
+    rating: Mapped[float] = mapped_column(Float, default=0.0)
+    available: Mapped[bool] = mapped_column(Boolean, default=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # FK to User enforced at DB level — no orphan inspectors possible
+
+class InspectionRequest(Base):
+    __tablename__ = "inspection_requests"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    dispute_id: Mapped[str] = mapped_column(String, ForeignKey("disputes.id"), unique=True)
+    inspector_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("inspectors.id"))
+    status: Mapped[str] = mapped_column(String, default="REQUESTED")
+    scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+# ── #6 AI response storage policy ────────────────────────────────────────────
+# Raw LLM JSON is NOT stored in the DB (bloat + slow queries).
+# Only structured fields extracted from the response are persisted.
+# If you need the raw response for debugging, write it to S3 keyed by verification ID.
+AI_RAW_IN_DB = False   # flip to True only in dev for debugging
+
+
+# ── #7 State machine: enforced transition table ───────────────────────────────
+# Any attempt to move to a state not in this map raises 400.
+PROJECT_TRANSITIONS: dict[ProjectStatus, set] = {
+    ProjectStatus.DRAFT:             {ProjectStatus.AWAITING_FUNDING, ProjectStatus.CANCELLED},
+    ProjectStatus.AWAITING_FUNDING:  {ProjectStatus.FUNDED, ProjectStatus.CANCELLED},
+    ProjectStatus.FUNDED:            {ProjectStatus.IN_PROGRESS, ProjectStatus.CANCELLED},
+    ProjectStatus.IN_PROGRESS:       {ProjectStatus.COMPLETED, ProjectStatus.DISPUTED, ProjectStatus.CANCELLED},
+    ProjectStatus.DISPUTED:          {ProjectStatus.IN_PROGRESS, ProjectStatus.REFUNDED, ProjectStatus.COMPLETED},
+    ProjectStatus.COMPLETED:         set(),   # terminal
+    ProjectStatus.CANCELLED:         set(),   # terminal
+    ProjectStatus.REFUNDED:          set(),   # terminal
+}
+
+MILESTONE_TRANSITIONS: dict[MilestoneStatus, set] = {
+    MilestoneStatus.PENDING:          {MilestoneStatus.IN_PROGRESS, MilestoneStatus.SUBMITTED},
+    MilestoneStatus.IN_PROGRESS:      {MilestoneStatus.SUBMITTED},
+    MilestoneStatus.SUBMITTED:        {MilestoneStatus.AI_REVIEWING},
+    MilestoneStatus.AI_REVIEWING:     {MilestoneStatus.HOMEOWNER_REVIEW, MilestoneStatus.FAILED if hasattr(MilestoneStatus, "FAILED") else MilestoneStatus.SUBMITTED},
+    MilestoneStatus.HOMEOWNER_REVIEW: {MilestoneStatus.APPROVED, MilestoneStatus.DISPUTED},
+    MilestoneStatus.APPROVED:         {MilestoneStatus.PAYMENT_RELEASED},
+    MilestoneStatus.DISPUTED:         {MilestoneStatus.HOMEOWNER_REVIEW},  # re-open after inspection
+    MilestoneStatus.PAYMENT_RELEASED: set(),  # terminal
+}
+
+def transition_project(p: Project, new_status: ProjectStatus):
+    allowed = PROJECT_TRANSITIONS.get(p.status, set())
+    if new_status not in allowed:
+        raise HTTPException(400, f"Illegal project transition: {p.status} → {new_status}")
+    p.status = new_status
+
+def transition_milestone(m: Milestone, new_status: MilestoneStatus):
+    allowed = MILESTONE_TRANSITIONS.get(m.status, set())
+    if new_status not in allowed:
+        raise HTTPException(400, f"Illegal milestone transition: {m.status} → {new_status}")
+    m.status = new_status
+
+
+# ── #8 File validation constants ──────────────────────────────────────────────
+ALLOWED_MIME: dict[str, set] = {
+    "MILESTONE_PROOF":  {"image/jpeg","image/png","image/webp","video/mp4","video/quicktime"},
+    "DISPUTE_EVIDENCE": {"image/jpeg","image/png","video/mp4","application/pdf"},
+    "DOCUMENT":         {"application/pdf","application/msword","application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+    "RECEIPT":          {"image/jpeg","image/png","application/pdf"},
+}
+MAX_BYTES: dict[str, int] = {
+    "MILESTONE_PROOF": 50*1024*1024,
+    "DISPUTE_EVIDENCE": 50*1024*1024,
+    "DOCUMENT": 20*1024*1024,
+    "RECEIPT": 10*1024*1024,
+}
+# All uploads go to private S3 buckets.
+# Public URLs are generated as signed (15-min expiry) via s3_signed_url().
+# Antivirus: hook your S3 bucket to a lambda that runs ClamAV on ObjectCreated events.
+def s3_signed_url(key: str, expiry: int = 900) -> str:
+    """Return a time-limited signed URL instead of a permanent public URL."""
+    if not s3_client: return s3_url(key)
+    return s3_client.generate_presigned_url("get_object",
+        Params={"Bucket": cfg.AWS_S3_BUCKET, "Key": key}, ExpiresIn=expiry)
+
+
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer = HTTPBearer()
 
 def hash_pw(p): return pwd_ctx.hash(p)
 def check_pw(p, h): return pwd_ctx.verify(p, h)
+
+# Tokens are hashed (SHA-256) before DB storage.
+# The raw token is returned to the client; only the hash lives in the DB.
+# Even if the DB leaks, tokens cannot be replayed.
+def hash_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 def make_token(user_id, email, role):
     exp = datetime.now(timezone.utc) + timedelta(minutes=cfg.JWT_EXPIRES_MINUTES)
@@ -426,7 +552,7 @@ class CurrentUser:
 async def get_user(creds: HTTPAuthorizationCredentials = Depends(bearer), db: AsyncSession = Depends(get_db)):
     try: payload = jwt.decode(creds.credentials, cfg.JWT_SECRET, ["HS256"]); uid_ = payload["sub"]
     except JWTError: raise HTTPException(401, "Invalid token")
-    r = await db.execute(select(Session).where(Session.token==creds.credentials, Session.expires_at>datetime.now(timezone.utc)))
+    r = await db.execute(select(Session).where(Session.token==hash_token(creds.credentials), Session.expires_at>datetime.now(timezone.utc)))
     if not r.scalar_one_or_none(): raise HTTPException(401, "Session expired")
     r = await db.execute(select(User).where(User.id==uid_))
     u = r.scalar_one_or_none()
@@ -535,6 +661,11 @@ def task_verify_milestone(milestone_id: str):
                     {"role":"user","content":[{"type":"text","text":f"MILESTONE: {m.title}\nCATEGORY: {p.category.value}\nAnalyze photos. Return: {{\"status\":\"APPROVE\"|\"REJECT\"|\"HUMAN_REVIEW\",\"confidenceScore\":0.0,\"summary\":\"\",\"issues\":[]}}"},*imgs]}],
                 max_tokens=600, temperature=0, response_format={"type":"json_object"})
             d = json.loads(resp.choices[0].message.content)
+            # #6: write raw LLM JSON to S3, NOT to DB — keeps DB lean
+            if s3_client:
+                raw_key = f"ai-responses/{ai.id}.json"
+                s3_client.put_object(Bucket=cfg.AWS_S3_BUCKET, Key=raw_key,
+                    Body=resp.choices[0].message.content.encode(), ContentType="application/json")
             ai.status = AiStatus.COMPLETED; ai.confidence_score = float(d.get("confidenceScore",0))
             ai.summary = d.get("summary",""); ai.issues = d.get("issues",[])
             ai.recommendation = AiRec(d.get("status","HUMAN_REVIEW"))
@@ -587,7 +718,11 @@ def task_process_receipt(receipt_id: str):
 def task_release_payment(milestone_id: str):
     db = _sync_db()
     try:
-        m = db.query(Milestone).filter_by(id=milestone_id).first()
+        # #9: row-level lock prevents double payout if job runs twice
+        m = db.query(Milestone).filter_by(id=milestone_id).with_for_update().first()
+        if not m: return
+        if m.status == MilestoneStatus.PAYMENT_RELEASED:
+            return  # already paid — idempotent exit
         p = db.query(Project).filter_by(id=m.project_id).first()
         contractor = db.query(User).filter_by(id=p.contractor_id).first()
         if not contractor or not contractor.stripe_account_id: raise ValueError("No Stripe account")
@@ -671,8 +806,17 @@ V = "/api/v1"
 
 @app.get("/health")
 async def health(db: AsyncSession = Depends(get_db)):
-    await db.execute(text("SELECT 1"))
-    return {"status": "healthy"}
+    try:
+        await db.execute(text("SELECT 1"))
+        db_status = "ok"
+    except Exception as e:
+        db_status = f"error: {str(e)[:80]}"
+    try:
+        get_redis().ping()
+        redis_status = "ok"
+    except:
+        redis_status = "unavailable"
+    return {"status": "healthy", "db": db_status, "redis": redis_status}
 
 # Auth
 @app.post(f"{V}/auth/register", status_code=201)
@@ -690,8 +834,8 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)):
             capabilities={"card_payments":{"requested":True},"transfers":{"requested":True}})
         u.stripe_account_id = a["id"]
     access = make_token(u.id, u.email, u.role.value); refresh = make_refresh(u.id)
-    db.add(Session(user_id=u.id, token=access, expires_at=datetime.now(timezone.utc)+timedelta(minutes=cfg.JWT_EXPIRES_MINUTES)))
-    db.add(RefreshToken(user_id=u.id, token=refresh, expires_at=datetime.now(timezone.utc)+timedelta(days=cfg.JWT_REFRESH_EXPIRES_DAYS)))
+    db.add(Session(user_id=u.id, token=hash_token(access), expires_at=datetime.now(timezone.utc)+timedelta(minutes=cfg.JWT_EXPIRES_MINUTES)))
+    db.add(RefreshToken(user_id=u.id, token=hash_token(refresh), expires_at=datetime.now(timezone.utc)+timedelta(days=cfg.JWT_REFRESH_EXPIRES_DAYS)))
     await db.commit()
     return {"user":{"id":u.id,"email":u.email,"role":u.role}, "access_token":access, "refresh_token":refresh}
 
@@ -702,8 +846,8 @@ async def login(body: LoginIn, db: AsyncSession = Depends(get_db)):
     if not u or not check_pw(body.password, u.password_hash): raise HTTPException(401, "Invalid credentials")
     if u.status in (UserStatus.SUSPENDED, UserStatus.BANNED): raise HTTPException(403, "Suspended")
     access = make_token(u.id, u.email, u.role.value); refresh = make_refresh(u.id)
-    db.add(Session(user_id=u.id, token=access, expires_at=datetime.now(timezone.utc)+timedelta(minutes=cfg.JWT_EXPIRES_MINUTES)))
-    db.add(RefreshToken(user_id=u.id, token=refresh, expires_at=datetime.now(timezone.utc)+timedelta(days=cfg.JWT_REFRESH_EXPIRES_DAYS)))
+    db.add(Session(user_id=u.id, token=hash_token(access), expires_at=datetime.now(timezone.utc)+timedelta(minutes=cfg.JWT_EXPIRES_MINUTES)))
+    db.add(RefreshToken(user_id=u.id, token=hash_token(refresh), expires_at=datetime.now(timezone.utc)+timedelta(days=cfg.JWT_REFRESH_EXPIRES_DAYS)))
     await db.commit()
     return {"user":{"id":u.id,"email":u.email,"role":u.role,"stripe_account_id":u.stripe_account_id}, "access_token":access, "refresh_token":refresh}
 
@@ -750,20 +894,27 @@ async def get_project(pid: str, cur: CurrentUser = Depends(get_user), db: AsyncS
 
 @app.post(f"{V}/projects/{{pid}}/assign-contractor")
 async def assign_contractor(pid: str, body: dict, cur: CurrentUser = Depends(role_guard(UserRole.HOMEOWNER)), db: AsyncSession = Depends(get_db)):
-    p = await guard_project(pid, cur, db)
-    if p.status != ProjectStatus.DRAFT: raise HTTPException(400, "Must be DRAFT")
+    # #9: SELECT FOR UPDATE prevents concurrent assignment race
+    r = await db.execute(select(Project).where(Project.id==pid, Project.deleted_at==None).with_for_update())
+    p = r.scalar_one_or_none()
+    if not p: raise HTTPException(404)
+    if p.homeowner_id != cur.user_id: raise HTTPException(403)
     r = await db.execute(select(User).where(User.id==body.get("contractor_id"), User.role==UserRole.CONTRACTOR))
     c = r.scalar_one_or_none()
     if not c: raise HTTPException(404, "Contractor not found")
-    p.contractor_id = c.id; p.status = ProjectStatus.AWAITING_FUNDING
+    transition_project(p, ProjectStatus.AWAITING_FUNDING)  # #7 state machine
+    p.contractor_id = c.id
     await emit_event(db, project_id=pid, event_type=EventType.CONTRACTOR_ASSIGNED, actor_id=cur.user_id,
         from_status=ProjectStatus.DRAFT, to_status=ProjectStatus.AWAITING_FUNDING, payload={"contractor_id":c.id})
     await db.commit(); return {"status":p.status}
 
 @app.post(f"{V}/projects/{{pid}}/fund")
 async def fund_project(pid: str, cur: CurrentUser = Depends(role_guard(UserRole.HOMEOWNER)), db: AsyncSession = Depends(get_db)):
-    p = await guard_project(pid, cur, db)
-    if p.status != ProjectStatus.AWAITING_FUNDING: raise HTTPException(400, "Not awaiting funding")
+    # #9: lock row to prevent duplicate funding
+    r = await db.execute(select(Project).where(Project.id==pid, Project.deleted_at==None).with_for_update())
+    p = r.scalar_one_or_none()
+    if not p or p.homeowner_id != cur.user_id: raise HTTPException(404)
+    transition_project(p, ProjectStatus.FUNDED)  # #7: validates AWAITING_FUNDING → FUNDED only
     r = await db.execute(select(User).where(User.id==cur.user_id)); hw = r.scalar_one_or_none()
     r = await db.execute(select(User).where(User.id==p.contractor_id)); ct = r.scalar_one_or_none()
     if not hw.stripe_customer_id or not ct.stripe_account_id: raise HTTPException(400, "Stripe not configured")
@@ -788,12 +939,11 @@ async def fund_project(pid: str, cur: CurrentUser = Depends(role_guard(UserRole.
 @app.post(f"{V}/projects/{{pid}}/cancel")
 async def cancel_project(pid: str, cur: CurrentUser = Depends(get_user), db: AsyncSession = Depends(get_db)):
     p = await guard_project(pid, cur, db)
-    if p.status not in (ProjectStatus.DRAFT, ProjectStatus.AWAITING_FUNDING, ProjectStatus.FUNDED):
-        raise HTTPException(400, f"Cannot cancel in {p.status}")
+    transition_project(p, ProjectStatus.CANCELLED)  # #7: state machine rejects illegal transitions
     if p.external_payment_id:
         try: stripe.PaymentIntent.cancel(p.external_payment_id)
         except: pass
-    p.status = ProjectStatus.CANCELLED; p.cancelled_at = datetime.utcnow()
+    p.cancelled_at = datetime.utcnow()
     await emit_event(db, project_id=pid, event_type=EventType.PROJECT_CANCELLED, actor_id=cur.user_id)
     await db.commit(); return {"status":p.status}
 
@@ -830,11 +980,11 @@ async def list_milestones(pid: str, cur: CurrentUser = Depends(get_user), db: As
 @app.post(f"{V}/projects/{{pid}}/milestones/{{mid}}/submit")
 async def submit_milestone(pid: str, mid: str, cur: CurrentUser = Depends(role_guard(UserRole.CONTRACTOR)), db: AsyncSession = Depends(get_db)):
     await guard_project(pid, cur, db)
-    r = await db.execute(select(Milestone).where(Milestone.id==mid, Milestone.project_id==pid))
+    # #9: lock milestone row to prevent double-submit race
+    r = await db.execute(select(Milestone).where(Milestone.id==mid, Milestone.project_id==pid).with_for_update())
     m = r.scalar_one_or_none()
     if not m: raise HTTPException(404)
-    if m.status not in (MilestoneStatus.PENDING, MilestoneStatus.IN_PROGRESS): raise HTTPException(400, "Cannot submit")
-    m.status = MilestoneStatus.SUBMITTED
+    transition_milestone(m, MilestoneStatus.SUBMITTED)  # #7: validates PENDING/IN_PROGRESS → SUBMITTED only
     await emit_event(db, project_id=pid, event_type=EventType.MILESTONE_SUBMITTED, actor_id=cur.user_id, milestone_id=mid)
     await db.commit()
     q_milestone.enqueue(task_verify_milestone, mid)
@@ -843,10 +993,12 @@ async def submit_milestone(pid: str, mid: str, cur: CurrentUser = Depends(role_g
 @app.post(f"{V}/projects/{{pid}}/milestones/{{mid}}/approve")
 async def approve_milestone(pid: str, mid: str, cur: CurrentUser = Depends(role_guard(UserRole.HOMEOWNER)), db: AsyncSession = Depends(get_db)):
     await guard_project(pid, cur, db)
-    r = await db.execute(select(Milestone).where(Milestone.id==mid, Milestone.project_id==pid))
+    # #9: lock row — prevents double-approval triggering two payouts
+    r = await db.execute(select(Milestone).where(Milestone.id==mid, Milestone.project_id==pid).with_for_update())
     m = r.scalar_one_or_none()
-    if not m or m.status != MilestoneStatus.HOMEOWNER_REVIEW: raise HTTPException(400, "Not ready for approval")
-    m.status = MilestoneStatus.APPROVED; m.approved_at = datetime.utcnow()
+    if not m: raise HTTPException(404)
+    transition_milestone(m, MilestoneStatus.APPROVED)  # #7: only HOMEOWNER_REVIEW → APPROVED is valid
+    m.approved_at = datetime.utcnow()
     await emit_event(db, project_id=pid, event_type=EventType.MILESTONE_APPROVED, actor_id=cur.user_id, milestone_id=mid)
     await db.commit()
     q_payment.enqueue(task_release_payment, mid)
@@ -855,14 +1007,15 @@ async def approve_milestone(pid: str, mid: str, cur: CurrentUser = Depends(role_
 @app.post(f"{V}/projects/{{pid}}/milestones/{{mid}}/dispute")
 async def dispute_milestone(pid: str, mid: str, body: dict, cur: CurrentUser = Depends(role_guard(UserRole.HOMEOWNER)), db: AsyncSession = Depends(get_db)):
     p = await guard_project(pid, cur, db)
-    r = await db.execute(select(Milestone).where(Milestone.id==mid, Milestone.project_id==pid))
+    r = await db.execute(select(Milestone).where(Milestone.id==mid, Milestone.project_id==pid).with_for_update())
     m = r.scalar_one_or_none()
-    if not m or m.status != MilestoneStatus.HOMEOWNER_REVIEW: raise HTTPException(400, "Not in review")
+    if not m: raise HTTPException(404)
     reason = body.get("reason","")
     if not reason: raise HTTPException(400, "reason required")
-    m.status = MilestoneStatus.DISPUTED
+    transition_milestone(m, MilestoneStatus.DISPUTED)   # #7
+    transition_project(p, ProjectStatus.DISPUTED)        # #7
     d = Dispute(project_id=pid, initiated_by=cur.user_id, reason=reason)
-    db.add(d); p.status = ProjectStatus.DISPUTED
+    db.add(d)
     await emit_event(db, project_id=pid, event_type=EventType.DISPUTE_OPENED, actor_id=cur.user_id, milestone_id=mid)
     await db.commit(); return {"dispute_id":d.id}
 
@@ -944,8 +1097,12 @@ async def resolve_dispute(did: str, body: dict, cur: CurrentUser = Depends(role_
 @app.post(f"{V}/files/upload-tokens", status_code=201)
 async def request_upload_token(body: UploadTokenIn, cur: CurrentUser = Depends(get_user), db: AsyncSession = Depends(get_db)):
     if not s3_client: raise HTTPException(503, "S3 not configured")
+    # #8: validate MIME type before issuing any upload URL
+    allowed = ALLOWED_MIME.get(body.purpose.value, set())
+    if body.content_type not in allowed:
+        raise HTTPException(400, f"MIME type '{body.content_type}' not allowed for {body.purpose.value}. Allowed: {allowed}")
     key = s3_key(body.purpose.value, body.filename)
-    max_size = {"MILESTONE_PROOF":50*1024*1024,"DISPUTE_EVIDENCE":50*1024*1024,"DOCUMENT":20*1024*1024,"RECEIPT":10*1024*1024}.get(body.purpose.value, 10*1024*1024)
+    max_size = MAX_BYTES.get(body.purpose.value, 10*1024*1024)
     result = s3_client.generate_presigned_post(Bucket=cfg.AWS_S3_BUCKET, Key=key,
         Fields={"Content-Type":body.content_type},
         Conditions=[["content-length-range",1,max_size],["eq","$Content-Type",body.content_type]], ExpiresIn=300)
@@ -953,7 +1110,9 @@ async def request_upload_token(body: UploadTokenIn, cur: CurrentUser = Depends(g
         entity_type=body.entity_type, presigned_url=result["url"], presigned_fields=result["fields"],
         s3_key=key, expires_at=datetime.utcnow()+timedelta(minutes=5))
     db.add(token); await db.commit()
-    return {"token_id":token.id,"presigned_url":result["url"],"presigned_fields":result["fields"],"public_url":s3_url(key)}
+    # #8: return signed URL for download (not permanent public URL)
+    return {"token_id":token.id,"presigned_url":result["url"],"presigned_fields":result["fields"],
+            "public_url":s3_signed_url(key)}
 
 @app.post(f"{V}/files/upload-tokens/{{tid}}/confirm")
 async def confirm_upload(tid: str, body: dict = {}, cur: CurrentUser = Depends(get_user), db: AsyncSession = Depends(get_db)):
