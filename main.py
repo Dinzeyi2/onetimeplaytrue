@@ -805,8 +805,11 @@ async def lifespan(app):
 app = FastAPI(title="MK Underwood", version="2.0.0",
     docs_url="/docs" if cfg.ENV != "production" else None, lifespan=lifespan)
 
-app.add_middleware(CORSMiddleware, allow_origins=[cfg.FRONTEND_URL,"http://localhost:5173"],
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*","Idempotency-Key"])
+app.add_middleware(CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"])
 
 class RateLimit(BaseHTTPMiddleware):
     async def dispatch(self, req, call_next):
