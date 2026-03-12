@@ -789,7 +789,8 @@ class ProjectIn(BaseModel):
     def get_budget(self): return self.total_amount or self.total_budget or 0
 
 class MilestoneIn(BaseModel):
-    title: str; description: Optional[str]=None; order: int; amount: int; due_date: Optional[datetime]=None
+    title: str; description: Optional[str]=None; order: Optional[int]=None; order_index: Optional[int]=None; amount: int; due_date: Optional[datetime]=None
+    def get_order(self): return self.order if self.order is not None else (self.order_index if self.order_index is not None else 0)
 
 class CompanyIn(BaseModel):
     name: str; email: EmailStr; phone: Optional[str]=None; license_number: Optional[str]=None
@@ -1005,7 +1006,7 @@ async def get_events(pid: str, cur: CurrentUser = Depends(get_user), db: AsyncSe
 @app.post(f"{V}/projects/{{pid}}/milestones", status_code=201)
 async def create_milestone(pid: str, body: MilestoneIn, cur: CurrentUser = Depends(get_user), db: AsyncSession = Depends(get_db)):
     await guard_project(pid, cur, db)
-    m = Milestone(project_id=pid, title=body.title, description=body.description, order=body.order, amount=body.amount, due_date=body.due_date)
+    m = Milestone(project_id=pid, title=body.title, description=body.description, order=body.get_order(), amount=body.amount, due_date=body.due_date)
     db.add(m); await db.commit()
     return {"id":m.id,"title":m.title,"amount":m.amount,"status":m.status}
 
