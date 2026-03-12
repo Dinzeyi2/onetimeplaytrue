@@ -154,7 +154,7 @@ class User(Base):
     stripe_account_id: Mapped[Optional[str]] = mapped_column(String, unique=True)
     stripe_customer_id: Mapped[Optional[str]] = mapped_column(String, unique=True)
     identity_verified: Mapped[bool] = mapped_column(Boolean, default=False)
-    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
     __table_args__ = (Index("ix_users_email","email"),)
@@ -164,7 +164,7 @@ class Session(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id", ondelete="CASCADE"))
     token: Mapped[str] = mapped_column(String, unique=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 class RefreshToken(Base):
@@ -172,7 +172,7 @@ class RefreshToken(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id", ondelete="CASCADE"))
     token: Mapped[str] = mapped_column(String, unique=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 class Company(Base):
@@ -185,7 +185,7 @@ class Company(Base):
     owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), unique=True)
     stripe_account_id: Mapped[Optional[str]] = mapped_column(String, unique=True)
     verified: Mapped[bool] = mapped_column(Boolean, default=False)
-    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     __table_args__ = (Index("ix_companies_email","email"),)
 
@@ -209,10 +209,10 @@ class Project(Base):
     contractor_payout: Mapped[int] = mapped_column(Integer)
     external_payment_id: Mapped[Optional[str]] = mapped_column(String, unique=True)
     escrow_funded: Mapped[bool] = mapped_column(Boolean, default=False)
-    escrow_funded_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    cancelled_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    escrow_funded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
     __table_args__ = (Index("ix_projects_homeowner","homeowner_id"), Index("ix_projects_status","status"))
@@ -226,10 +226,10 @@ class Milestone(Base):
     order: Mapped[int] = mapped_column(Integer)
     amount: Mapped[int] = mapped_column(Integer)
     status: Mapped[MilestoneStatus] = mapped_column(E(MilestoneStatus), default=MilestoneStatus.PENDING)
-    due_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    released_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    due_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    released_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
     __table_args__ = (Index("ix_milestones_project","project_id"),)
@@ -300,10 +300,10 @@ class Dispute(Base):
     status: Mapped[DisputeStatus] = mapped_column(E(DisputeStatus), default=DisputeStatus.OPEN)
     resolution: Mapped[Optional[str]] = mapped_column(Text)
     resolved_by: Mapped[Optional[str]] = mapped_column(String, ForeignKey("users.id"))  # #4 FK enforced
-    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     outcome: Mapped[Optional[DisputeOutcome]] = mapped_column(E(DisputeOutcome))
     refund_amount: Mapped[Optional[int]] = mapped_column(Integer)
-    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
     __table_args__ = (Index("ix_disputes_project","project_id"),)
@@ -326,13 +326,13 @@ class Receipt(Base):
     vendor_email: Mapped[Optional[str]] = mapped_column(String)
     vendor_name: Mapped[Optional[str]] = mapped_column(String)
     amount: Mapped[Optional[int]] = mapped_column(Integer)
-    receipt_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    receipt_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     items: Mapped[Optional[list]] = mapped_column(JSON)
     auto_linked_company_id: Mapped[Optional[str]] = mapped_column(String)
     auto_linked: Mapped[bool] = mapped_column(Boolean, default=False)
     processing_status: Mapped[ReceiptStatus] = mapped_column(E(ReceiptStatus), default=ReceiptStatus.PENDING)
     processing_error: Mapped[Optional[str]] = mapped_column(String)
-    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     __table_args__ = (Index("ix_receipts_vendor_email","vendor_email"),)
 
@@ -346,7 +346,7 @@ class Document(Base):
     file_key: Mapped[str] = mapped_column(String)
     mime_type: Mapped[str] = mapped_column(String)
     size_bytes: Mapped[int] = mapped_column(Integer)
-    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 class ProofOfFundsCert(Base):
@@ -355,8 +355,8 @@ class ProofOfFundsCert(Base):
     project_id: Mapped[str] = mapped_column(String, ForeignKey("projects.id"), unique=True)
     cert_number: Mapped[str] = mapped_column(String, unique=True)
     issued_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    expires_at: Mapped[datetime] = mapped_column(DateTime)
-    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
 class Notification(Base):
     __tablename__ = "notifications"
@@ -367,7 +367,7 @@ class Notification(Base):
     title: Mapped[str] = mapped_column(String)
     body: Mapped[str] = mapped_column(String)
     read: Mapped[bool] = mapped_column(Boolean, default=False)
-    read_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     __table_args__ = (Index("ix_notifs_user","user_id","read"),)
 
@@ -397,7 +397,7 @@ class UploadToken(Base):
     presigned_fields: Mapped[dict] = mapped_column(JSON)
     s3_key: Mapped[str] = mapped_column(String)
     used: Mapped[bool] = mapped_column(Boolean, default=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 class WebhookEvent(Base):
@@ -408,7 +408,7 @@ class WebhookEvent(Base):
     event_type: Mapped[str] = mapped_column(String)
     payload: Mapped[dict] = mapped_column(JSON)
     processed: Mapped[bool] = mapped_column(Boolean, default=False)
-    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     error: Mapped[Optional[str]] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     __table_args__ = (Index("ix_webhook_event_id","event_id"),)
@@ -443,7 +443,7 @@ class Inspector(Base):
     service_areas: Mapped[Optional[list]] = mapped_column(JSON)
     rating: Mapped[float] = mapped_column(Float, default=0.0)
     available: Mapped[bool] = mapped_column(Boolean, default=True)
-    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     # FK to User enforced at DB level — no orphan inspectors possible
 
@@ -453,8 +453,8 @@ class InspectionRequest(Base):
     dispute_id: Mapped[str] = mapped_column(String, ForeignKey("disputes.id"), unique=True)
     inspector_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("inspectors.id"))
     status: Mapped[str] = mapped_column(String, default="REQUESTED")
-    scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     notes: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
