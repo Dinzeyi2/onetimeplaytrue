@@ -47,10 +47,11 @@ class Settings(BaseSettings):
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
     PLATFORM_FEE_PERCENT: float = 1.5
-    AWS_REGION: str = "us-east-1"
+    AWS_REGION: str = "auto"
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_S3_BUCKET: str = ""
+    S3_ENDPOINT_URL: str = ""  # R2: https://<account_id>.r2.cloudflarestorage.com — leave blank for AWS
     OPENAI_API_KEY: str = ""
     SENDGRID_API_KEY: str = ""
     SENDGRID_FROM_EMAIL: str = "noreply@mkunderwood.com"
@@ -571,8 +572,12 @@ stripe.api_key = cfg.STRIPE_SECRET_KEY
 stripe.max_network_retries = 3
 ai_client = OpenAI(api_key=cfg.OPENAI_API_KEY) if cfg.OPENAI_API_KEY else None
 sg_client = SendGridAPIClient(cfg.SENDGRID_API_KEY) if cfg.SENDGRID_API_KEY else None
-s3_client = boto3.client("s3", region_name=cfg.AWS_REGION,
-    aws_access_key_id=cfg.AWS_ACCESS_KEY_ID, aws_secret_access_key=cfg.AWS_SECRET_ACCESS_KEY) if cfg.AWS_ACCESS_KEY_ID else None
+s3_client = boto3.client("s3",
+    region_name=cfg.AWS_REGION,
+    aws_access_key_id=cfg.AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=cfg.AWS_SECRET_ACCESS_KEY,
+    endpoint_url=cfg.S3_ENDPOINT_URL or None,  # set this for R2, leave blank for AWS
+) if cfg.AWS_ACCESS_KEY_ID else None
 
 _redis = None
 def get_redis():
