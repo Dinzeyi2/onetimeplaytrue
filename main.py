@@ -547,6 +547,8 @@ def make_refresh(user_id):
 class CurrentUser:
     def __init__(self, user_id, email, role): self.user_id=user_id; self.email=email; self.role=role
 
+bearer = HTTPBearer()
+
 async def get_user(creds: HTTPAuthorizationCredentials = Depends(bearer), db: AsyncSession = Depends(get_db)):
     try: payload = jwt.decode(creds.credentials, cfg.JWT_SECRET, ["HS256"]); uid_ = payload["sub"]
     except JWTError: raise HTTPException(401, "Invalid token")
