@@ -931,6 +931,15 @@ async def get_project(pid: str, cur: CurrentUser = Depends(get_user), db: AsyncS
             "contractor_payout":p.contractor_payout,"escrow_funded":p.escrow_funded,
             "homeowner_id":p.homeowner_id,"contractor_id":p.contractor_id,"company_id":p.company_id}
 
+@app.patch(f"{V}/projects/{{pid}}")
+@app.put(f"{V}/projects/{{pid}}")
+async def update_project(pid: str, body: dict, cur: CurrentUser = Depends(role_guard(UserRole.HOMEOWNER)), db: AsyncSession = Depends(get_db)):
+    p = await guard_project(pid, cur, db)
+    if "title" in body: p.title = body["title"]
+    if "description" in body: p.description = body["description"]
+    await db.commit()
+    return {"id":p.id,"title":p.title,"description":p.description,"status":p.status}
+
 @app.post(f"{V}/projects/{{pid}}/assign-contractor")
 async def assign_contractor(pid: str, body: dict, cur: CurrentUser = Depends(role_guard(UserRole.HOMEOWNER)), db: AsyncSession = Depends(get_db)):
     # #9: SELECT FOR UPDATE prevents concurrent assignment race
@@ -1090,6 +1099,32 @@ async def lookup_company(email: str, cur: CurrentUser = Depends(get_user), db: A
     c = r.scalar_one_or_none()
     if not c: raise HTTPException(404)
     return {"id":c.id,"name":c.name,"email":c.email,"verified":c.verified}
+
+@app.post(f"{V}/disputes", status_code=201)
+async def create_dispute_root(body: dict, cur: CurrentUser = Depends(get_user), db: AsyncSession = Depends(get_db)):
+    pid = body.get("project_id","")
+    await guard_project(pid, cur, db)
+    d = Dispute(project_id=pid, initiated_by=cur.user_id, reason=body.get("reason",""), milestone_id=body.get("milestone_id"))
+    db.add(d); await db.commit()
+    return {"id":d.id,"project_id":pid,"reason":d.reason,"status":d.status}
+
+@app.get(f"{V}/disputes")
+async def list_disputes_root(cur: CurrentUser = Depends(get_user), db: AsyncSession = Depends(get_db)):
+    r = await db.execute(select(Dispute).where(Dispute.initiated_by==cur.user_id))
+    return [{"id":d.id,"project_id":d.project_id,"reason":d.reason,"status":d.status} for d in r.scalars()]
+
+@app.post(f"{V}/projects/{{pid}}/disputes", status_code=201)
+async def create_project_dispute(pid: str, body: dict, cur: CurrentUser = Depends(get_user), db: AsyncSession = Depends(get_db)):
+    await guard_project(pid, cur, db)
+    d = Dispute(project_id=pid, initiated_by=cur.user_id, reason=body.get("reason",""), milestone_id=body.get("milestone_id"))
+    db.add(d); await db.commit()
+    return {"id":d.id,"project_id":pid,"reason":d.reason,"status":d.status}
+
+@app.get(f"{V}/projects/{{pid}}/disputes")
+async def list_project_disputes(pid: str, cur: CurrentUser = Depends(get_user), db: AsyncSession = Depends(get_db)):
+    await guard_project(pid, cur, db)
+    r = await db.execute(select(Dispute).where(Dispute.project_id==pid))
+    return [{"id":d.id,"reason":d.reason,"status":d.status,"milestone_id":d.milestone_id} for d in r.scalars()]
 
 # Disputes
 @app.get(f"{V}/disputes/{{did}}")
