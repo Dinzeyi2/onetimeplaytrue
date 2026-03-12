@@ -781,9 +781,12 @@ class LoginIn(BaseModel):
     email: EmailStr; password: str
 
 class ProjectIn(BaseModel):
-    title: str; description: Optional[str]=None; category: ProjectCategory
-    address_line1: str; city: str; state: str; zip_code: str
-    total_amount: int
+    title: str; description: Optional[str]=None
+    category: Optional[ProjectCategory]=None
+    address_line1: Optional[str]=None; city: Optional[str]=None; state: Optional[str]=None; zip_code: Optional[str]=None
+    total_amount: Optional[int]=None; total_budget: Optional[int]=None
+    contractor_email: Optional[str]=None
+    def get_budget(self): return self.total_amount or self.total_budget or 0
 
 class MilestoneIn(BaseModel):
     title: str; description: Optional[str]=None; order: int; amount: int; due_date: Optional[datetime]=None
@@ -893,12 +896,18 @@ async def me(cur: CurrentUser = Depends(get_user), db: AsyncSession = Depends(ge
 # Projects
 @app.post(f"{V}/projects", status_code=201)
 async def create_project(body: ProjectIn, cur: CurrentUser = Depends(role_guard(UserRole.HOMEOWNER)), db: AsyncSession = Depends(get_db)):
-    fee = int(body.total_amount * cfg.PLATFORM_FEE_PERCENT / 100)
+    budget = body.get_budget()
+    fee = int(budget * cfg.PLATFORM_FEE_PERCENT / 100)
     p = Project(homeowner_id=cur.user_id, title=body.title, description=body.description,
         category=body.category, address_line1=body.address_line1, city=body.city,
-        state=body.state, zip_code=body.zip_code, total_amount=body.total_amount,
-        platform_fee_percent=cfg.PLATFORM_FEE_PERCENT, platform_fee=fee, contractor_payout=body.total_amount-fee)
+        state=body.state, zip_code=body.zip_code, total_amount=budget,
+        platform_fee_percent=cfg.PLATFORM_FEE_PERCENT, platform_fee=fee, contractor_payout=budget-fee)
     db.add(p); await db.flush()
+    # auto-assign contractor by email if provided
+    if body.contractor_email:
+        cr = await db.execute(select(User).where(User.email==body.contractor_email.lower(), User.role==UserRole.CONTRACTOR))
+        contractor = cr.scalar_one_or_none()
+        if contractor: p.contractor_id = contractor.id
     await emit_event(db, project_id=p.id, event_type=EventType.PROJECT_CREATED, actor_id=cur.user_id, to_status=ProjectStatus.DRAFT)
     await db.commit()
     return {"id":p.id,"status":p.status,"total_amount":p.total_amount}
