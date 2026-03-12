@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 import anthropic
-from passlib.context import CryptContext
+import bcrypt as bcrypt_lib
 from pydantic import BaseModel, EmailStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from rq import Queue
@@ -527,11 +527,8 @@ def s3_signed_url(key: str, expiry: int = 900) -> str:
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-bearer = HTTPBearer()
-
-def hash_pw(p): return pwd_ctx.hash(p[:72])
-def check_pw(p, h): return pwd_ctx.verify(p[:72], h)
+def hash_pw(p): return bcrypt_lib.hashpw(p[:72].encode(), bcrypt_lib.gensalt()).decode()
+def check_pw(p, h): return bcrypt_lib.checkpw(p[:72].encode(), h.encode())
 
 # Tokens are hashed (SHA-256) before DB storage.
 # The raw token is returned to the client; only the hash lives in the DB.
