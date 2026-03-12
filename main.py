@@ -760,10 +760,10 @@ def task_release_payment(milestone_id: str):
                 type=LedgerType.MILESTONE_RELEASED, direction=LedgerDir.DEBIT,
                 amount_cents=m.amount, balance_cents=prev-m.amount,
                 external_ref=transfer["id"], idempotency_key=ikey, description=f"Milestone: {m.title}"))
-        m.status = MilestoneStatus.PAYMENT_RELEASED; m.released_at = datetime.utcnow()
+        m.status = MilestoneStatus.PAYMENT_RELEASED; m.released_at = datetime.now(timezone.utc)
         remaining = db.query(Milestone).filter(
             Milestone.project_id==m.project_id, Milestone.status!=MilestoneStatus.PAYMENT_RELEASED, Milestone.deleted_at==None).count()
-        if remaining == 0: p.status = ProjectStatus.COMPLETED; p.completed_at = datetime.utcnow()
+        if remaining == 0: p.status = ProjectStatus.COMPLETED; p.completed_at = datetime.now(timezone.utc)
         for uid_ in [p.homeowner_id, p.contractor_id]:
             if uid_: db.add(Notification(user_id=uid_, project_id=m.project_id, type=NotifType.PAYMENT_RELEASED,
                 title=f"Payment released: {m.title}", body=f"${m.amount/100:.2f} transferred."))
@@ -949,7 +949,7 @@ async def fund_project(pid: str, cur: CurrentUser = Depends(role_guard(UserRole.
         transfer_data={"destination":ct.stripe_account_id}, application_fee_amount=p.platform_fee,
         description=f"MK Underwood - {p.title}", metadata={"project_id":pid})
     p.external_payment_id = intent["id"]; p.status = ProjectStatus.FUNDED
-    p.escrow_funded = True; p.escrow_funded_at = datetime.utcnow()
+    p.escrow_funded = True; p.escrow_funded_at = datetime.now(timezone.utc)
     await write_ledger(db, project_id=pid, type=LedgerType.ESCROW_FUNDED, direction=LedgerDir.CREDIT,
         amount_cents=p.total_amount, description="Escrow funded", external_ref=intent["id"],
         ikey=f"fund:{pid}", actor_id=cur.user_id)
@@ -969,7 +969,7 @@ async def cancel_project(pid: str, cur: CurrentUser = Depends(get_user), db: Asy
     if p.external_payment_id:
         try: stripe.PaymentIntent.cancel(p.external_payment_id)
         except: pass
-    p.cancelled_at = datetime.utcnow()
+    p.cancelled_at = datetime.now(timezone.utc)
     await emit_event(db, project_id=pid, event_type=EventType.PROJECT_CANCELLED, actor_id=cur.user_id)
     await db.commit(); return {"status":p.status}
 
@@ -1024,7 +1024,7 @@ async def approve_milestone(pid: str, mid: str, cur: CurrentUser = Depends(role_
     m = r.scalar_one_or_none()
     if not m: raise HTTPException(404)
     transition_milestone(m, MilestoneStatus.APPROVED)  # #7: only HOMEOWNER_REVIEW → APPROVED is valid
-    m.approved_at = datetime.utcnow()
+    m.approved_at = datetime.now(timezone.utc)
     await emit_event(db, project_id=pid, event_type=EventType.MILESTONE_APPROVED, actor_id=cur.user_id, milestone_id=mid)
     await db.commit()
     q_payment.enqueue(task_release_payment, mid)
@@ -1109,7 +1109,7 @@ async def resolve_dispute(did: str, body: dict, cur: CurrentUser = Depends(role_
     outcome = body.get("outcome")
     if not outcome: raise HTTPException(400, "outcome required")
     d.status = DisputeStatus.RESOLVED; d.outcome = DisputeOutcome(outcome)
-    d.resolved_by = cur.user_id; d.resolved_at = datetime.utcnow(); d.resolution = body.get("resolution","")
+    d.resolved_by = cur.user_id; d.resolved_at = datetime.now(timezone.utc); d.resolution = body.get("resolution","")
     if outcome == "FULL_REFUND":
         stripe.Refund.create(payment_intent=p.external_payment_id)
         p.status = ProjectStatus.REFUNDED
@@ -1134,7 +1134,7 @@ async def request_upload_token(body: UploadTokenIn, cur: CurrentUser = Depends(g
         Conditions=[["content-length-range",1,max_size],["eq","$Content-Type",body.content_type]], ExpiresIn=300)
     token = UploadToken(user_id=cur.user_id, purpose=body.purpose, entity_id=body.entity_id,
         entity_type=body.entity_type, presigned_url=result["url"], presigned_fields=result["fields"],
-        s3_key=key, expires_at=datetime.utcnow()+timedelta(minutes=5))
+        s3_key=key, expires_at=datetime.now(timezone.utc)+timedelta(minutes=5))
     db.add(token); await db.commit()
     # #8: return signed URL for download (not permanent public URL)
     return {"token_id":token.id,"presigned_url":result["url"],"presigned_fields":result["fields"],
@@ -1164,7 +1164,7 @@ async def list_notifs(cur: CurrentUser = Depends(get_user), db: AsyncSession = D
 async def mark_read(nid: str, cur: CurrentUser = Depends(get_user), db: AsyncSession = Depends(get_db)):
     r = await db.execute(select(Notification).where(Notification.id==nid, Notification.user_id==cur.user_id))
     n = r.scalar_one_or_none()
-    if n: n.read = True; n.read_at = datetime.utcnow(); await db.commit()
+    if n: n.read = True; n.read_at = datetime.now(timezone.utc); await db.commit()
     return {"ok":True}
 
 # Admin
@@ -1209,6 +1209,6 @@ async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             r2 = await db.execute(select(User).where(User.stripe_account_id==data["id"]))
             u = r2.scalar_one_or_none()
             if u and data.get("charges_enabled") and data.get("payouts_enabled"): u.identity_verified = True
-        we.processed = True; we.processed_at = datetime.utcnow()
+        we.processed = True; we.processed_at = datetime.now(timezone.utc)
     except Exception as e: we.error = str(e)
     await db.commit(); return {"status":"ok"}
