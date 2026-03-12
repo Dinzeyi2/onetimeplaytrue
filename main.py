@@ -530,8 +530,8 @@ def s3_signed_url(key: str, expiry: int = 900) -> str:
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer = HTTPBearer()
 
-def hash_pw(p): return pwd_ctx.hash(p)
-def check_pw(p, h): return pwd_ctx.verify(p, h)
+def hash_pw(p): return pwd_ctx.hash(p[:72])
+def check_pw(p, h): return pwd_ctx.verify(p[:72], h)
 
 # Tokens are hashed (SHA-256) before DB storage.
 # The raw token is returned to the client; only the hash lives in the DB.
