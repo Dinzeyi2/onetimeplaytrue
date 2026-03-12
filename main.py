@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from openai import OpenAI
+import anthropic
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_S3_BUCKET: str = ""
     S3_ENDPOINT_URL: str = ""  # R2: https://<account_id>.r2.cloudflarestorage.com — leave blank for AWS
-    OPENAI_API_KEY: str = ""
+    ANTHROPIC_API_KEY: str = ""
     SENDGRID_API_KEY: str = ""
     SENDGRID_FROM_EMAIL: str = "noreply@mkunderwood.com"
     SENDGRID_FROM_NAME: str = "MK Underwood"
@@ -570,7 +570,7 @@ def role_guard(*roles):
 # ── External clients ──────────────────────────────────────────────────────────
 stripe.api_key = cfg.STRIPE_SECRET_KEY
 stripe.max_network_retries = 3
-ai_client = OpenAI(api_key=cfg.OPENAI_API_KEY) if cfg.OPENAI_API_KEY else None
+ai_client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY) if cfg.ANTHROPIC_API_KEY else None
 sg_client = SendGridAPIClient(cfg.SENDGRID_API_KEY) if cfg.SENDGRID_API_KEY else None
 s3_client = boto3.client("s3",
     region_name=cfg.AWS_REGION,
@@ -660,20 +660,34 @@ def task_verify_milestone(milestone_id: str):
         proofs = db.query(MilestoneProof).filter_by(milestone_id=milestone_id).all()
         urls = [x.file_url for x in proofs if x.type in (ProofType.PHOTO, ProofType.VIDEO)]
         if ai_client and urls:
-            imgs = [{"type":"image_url","image_url":{"url":u,"detail":"high"}} for u in urls[:8]]
-            resp = ai_client.chat.completions.create(model="gpt-4o",
-                messages=[{"role":"system","content":"You are a construction inspector. Return ONLY JSON."},
-                    {"role":"user","content":[{"type":"text","text":f"MILESTONE: {m.title}\nCATEGORY: {p.category.value}\nAnalyze photos. Return: {{\"status\":\"APPROVE\"|\"REJECT\"|\"HUMAN_REVIEW\",\"confidenceScore\":0.0,\"summary\":\"\",\"issues\":[]}}"},*imgs]}],
-                max_tokens=600, temperature=0, response_format={"type":"json_object"})
-            d = json.loads(resp.choices[0].message.content)
-            # #6: write raw LLM JSON to S3, NOT to DB — keeps DB lean
+            # Build image content blocks for Anthropic
+            img_blocks = []
+            for u in urls[:8]:
+                import urllib.request
+                try:
+                    with urllib.request.urlopen(u, timeout=10) as r:
+                        import base64
+                        img_data = base64.standard_b64encode(r.read()).decode()
+                        img_blocks.append({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":img_data}})
+                except: pass
+            img_blocks.append({"type":"text","text":f"MILESTONE: {m.title}\nCATEGORY: {p.category.value}\nAnalyze these construction photos. Return ONLY JSON: {{\"status\":\"APPROVE\"|\"REJECT\"|\"HUMAN_REVIEW\",\"confidenceScore\":0.0,\"summary\":\"\",\"issues\":[]}}"})
+            resp = ai_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=600,
+                messages=[{"role":"user","content":img_blocks}]
+            )
+            import re
+            raw = resp.content[0].text
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            d = json.loads(json_match.group()) if json_match else {}
+            # #6: write raw response to S3, not DB
             if s3_client:
                 raw_key = f"ai-responses/{ai.id}.json"
                 s3_client.put_object(Bucket=cfg.AWS_S3_BUCKET, Key=raw_key,
-                    Body=resp.choices[0].message.content.encode(), ContentType="application/json")
-            ai.status = AiStatus.COMPLETED; ai.confidence_score = float(d.get("confidenceScore",0))
-            ai.summary = d.get("summary",""); ai.issues = d.get("issues",[])
-            ai.recommendation = AiRec(d.get("status","HUMAN_REVIEW"))
+                    Body=raw.encode(), ContentType="application/json")
+            ai.status = AiStatus.COMPLETED; ai.confidence_score = float(d.get("confidenceScore", 0))
+            ai.summary = d.get("summary", ""); ai.issues = d.get("issues", [])
+            ai.recommendation = AiRec(d.get("status", "HUMAN_REVIEW"))
         else:
             ai.status = AiStatus.COMPLETED; ai.recommendation = AiRec.HUMAN_REVIEW
             ai.summary = "No photos — manual review required"; ai.confidence_score = 0
@@ -697,10 +711,15 @@ def task_process_receipt(receipt_id: str):
         r.processing_status = ReceiptStatus.PROCESSING; db.commit()
         extracted = {}
         if ai_client and r.raw_text:
-            resp = ai_client.chat.completions.create(model="gpt-4o",
-                messages=[{"role":"user","content":f"Extract: vendorName, vendorEmail, amount (cents int), receiptDate (ISO). JSON only.\n{r.raw_text[:4000]}"}],
-                max_tokens=400, temperature=0, response_format={"type":"json_object"})
-            extracted = json.loads(resp.choices[0].message.content)
+            resp = ai_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=400,
+                messages=[{"role":"user","content":f"Extract: vendorName, vendorEmail, amount (cents int), receiptDate (ISO). Return ONLY JSON, nothing else.\n{r.raw_text[:4000]}"}]
+            )
+            import re
+            raw = resp.content[0].text
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            extracted = json.loads(json_match.group()) if json_match else {}
         r.vendor_name = extracted.get("vendorName"); r.vendor_email = (extracted.get("vendorEmail") or "").lower().strip() or None
         r.amount = extracted.get("amount"); r.processing_status = ReceiptStatus.COMPLETED; db.commit()
         if r.vendor_email:
