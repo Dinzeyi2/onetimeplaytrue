@@ -22,7 +22,7 @@ from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 from sqlalchemy import (
     Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String,
-    Text, UniqueConstraint, Enum as E, select, text,
+    Text, UniqueConstraint, Enum as E, select, delete, text,
 )
 from sqlalchemy.ext.asyncio import (
     AsyncSession, async_sessionmaker, create_async_engine,
@@ -872,6 +872,7 @@ async def login(body: LoginIn, db: AsyncSession = Depends(get_db)):
     if not u or not check_pw(body.password, u.password_hash): raise HTTPException(401, "Invalid credentials")
     if u.status in (UserStatus.SUSPENDED, UserStatus.BANNED): raise HTTPException(403, "Suspended")
     access = make_token(u.id, u.email, u.role.value); refresh = make_refresh(u.id)
+    await db.execute(delete(RefreshToken).where(RefreshToken.user_id==u.id))
     db.add(Session(user_id=u.id, token=hash_token(access), expires_at=datetime.now(timezone.utc)+timedelta(minutes=cfg.JWT_EXPIRES_MINUTES)))
     db.add(RefreshToken(user_id=u.id, token=hash_token(refresh), expires_at=datetime.now(timezone.utc)+timedelta(days=cfg.JWT_REFRESH_EXPIRES_DAYS)))
     await db.commit()
