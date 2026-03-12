@@ -530,8 +530,6 @@ def s3_signed_url(key: str, expiry: int = 900) -> str:
 def hash_pw(p): return bcrypt_lib.hashpw(p[:72].encode(), bcrypt_lib.gensalt()).decode()
 def check_pw(p, h): return bcrypt_lib.checkpw(p[:72].encode(), h.encode())
 
-bearer = HTTPBearer()
-
 # Tokens are hashed (SHA-256) before DB storage.
 # The raw token is returned to the client; only the hash lives in the DB.
 # Even if the DB leaks, tokens cannot be replayed.
