@@ -782,7 +782,7 @@ class LoginIn(BaseModel):
 
 class ProjectIn(BaseModel):
     title: str; description: Optional[str]=None
-    category: Optional[ProjectCategory]=None
+    category: Optional[str]=None
     address_line1: Optional[str]=None; city: Optional[str]=None; state: Optional[str]=None; zip_code: Optional[str]=None
     total_amount: Optional[int]=None; total_budget: Optional[int]=None
     contractor_email: Optional[str]=None
@@ -898,8 +898,10 @@ async def me(cur: CurrentUser = Depends(get_user), db: AsyncSession = Depends(ge
 async def create_project(body: ProjectIn, cur: CurrentUser = Depends(role_guard(UserRole.HOMEOWNER)), db: AsyncSession = Depends(get_db)):
     budget = body.get_budget()
     fee = int(budget * cfg.PLATFORM_FEE_PERCENT / 100)
+    try: cat = ProjectCategory(body.category.upper().replace(" ","_")) if body.category else ProjectCategory.OTHER
+    except ValueError: cat = ProjectCategory.OTHER
     p = Project(homeowner_id=cur.user_id, title=body.title, description=body.description,
-        category=body.category, address_line1=body.address_line1, city=body.city,
+        category=cat, address_line1=body.address_line1, city=body.city,
         state=body.state, zip_code=body.zip_code, total_amount=budget,
         platform_fee_percent=cfg.PLATFORM_FEE_PERCENT, platform_fee=fee, contractor_payout=budget-fee)
     db.add(p); await db.flush()
